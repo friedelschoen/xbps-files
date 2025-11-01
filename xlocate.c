@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <xbps.h>
+#include <xbps/xbps_array.h>
+#include <xbps/xbps_dictionary.h>
 
 #define UNUSED __attribute__((unused))
 
@@ -57,50 +59,13 @@ static void sb_append_line(struct sb* b, const char* pkgver,
 	sb_append(b, line, n);
 }
 
-/* ---------- resultatenbuffer voor (pkgver, blob_oid) ---------- */
-struct entry {
-	char*   name; /* pkgver */
-	git_oid oid;  /* blob id */
-};
-
-struct resultset {
-	struct entry* ents;
-	size_t        cnt, cap;
-};
-
-static void result_append(struct resultset* rs, const char* pkgver, const git_oid* oid) {
-	if (rs->cnt == rs->cap) {
-		size_t        nc = rs->cap ? rs->cap * 2 : 256;
-		struct entry* p  = realloc(rs->ents, nc * sizeof(*rs->ents));
-		if (!p) {
-			fprintf(stderr, "oom results\n");
-			exit(EXIT_FAILURE);
-		}
-		rs->ents = p;
-		rs->cap  = nc;
-	}
-	rs->ents[rs->cnt].name = strdup(pkgver);
-	if (!rs->ents[rs->cnt].name) {
-		fprintf(stderr, "oom strdup\n");
-		exit(EXIT_FAILURE);
-	}
-	git_oid_cpy(&rs->ents[rs->cnt].oid, oid);
-	rs->cnt++;
-}
-
-static void result_free(struct resultset* rs) {
-	for (size_t i = 0; i < rs->cnt; i++) free(rs->ents[i].name);
-	free(rs->ents);
-	rs->ents = NULL;
-	rs->cnt = rs->cap = 0;
-}
-
 /* ---------- gedeelde context (alleen thread-safe gebruiken!) ---------- */
 struct ffdata {
 	const char*      repouri; /* alleen-lezen set per repo-ownedby callback */
 	git_repository*  repo;    /* gedeeld; alleen gebruiken onder gitmtx */
 	pthread_mutex_t  gitmtx;  /* beschermt repo-toegang en result_append */
-	struct resultset results; /* gevuld vanuit parallelle callbacks onder lock */
+	git_treebuilder* tb;
+	int              idx, total;
 };
 
 /* ---------- bestandslijst verzamelen (schrijft naar lokale sb) ---------- */
@@ -144,8 +109,6 @@ static int repo_match_cb(struct xbps_handle* xhp, xbps_object_t obj,
 	xbps_dictionary_set_cstring_nocopy(obj, "repository", ffd->repouri);
 	xbps_dictionary_get_cstring_nocopy(obj, "pkgver", &pkgver);
 
-	printf("- %s\n", pkgver);
-
 	int r = xbps_pkg_path_or_url(xhp, bfile, sizeof(bfile), obj);
 	if (r < 0) {
 		xbps_error_printf("could not get package path: %s\n", strerror(-r));
@@ -173,6 +136,9 @@ static int repo_match_cb(struct xbps_handle* xhp, xbps_object_t obj,
 	git_oid blob_id;
 	pthread_mutex_lock(&ffd->gitmtx);
 
+	ffd->idx++;
+	fprintf(stderr, "\r\033[2K%.1f%% %s", 100.0 * ffd->idx / ffd->total, pkgver);
+
 	int gr = git_blob_create_frombuffer(&blob_id, ffd->repo,
 	                                    b.data ? b.data : "", b.len);
 	if (gr != 0) {
@@ -184,7 +150,16 @@ static int repo_match_cb(struct xbps_handle* xhp, xbps_object_t obj,
 		return EIO;
 	}
 
-	result_append(&ffd->results, pkgver, &blob_id);
+	gr = git_treebuilder_insert(NULL, ffd->tb,
+	                            pkgver,
+	                            &blob_id,
+	                            GIT_FILEMODE_BLOB);
+	if (gr != 0) {
+		const git_error* ge = git_error_last();
+		fprintf(stderr, "git: tree insert failed for %s: %s\n", pkgver, ge && ge->message ? ge->message : "unknown");
+		/* je kunt hier desnoods 'continue' doen; we failen hard: */
+	}
+
 
 	pthread_mutex_unlock(&ffd->gitmtx);
 
@@ -196,6 +171,8 @@ static int repo_match_cb(struct xbps_handle* xhp, xbps_object_t obj,
 static int repo_ownedby_cb(struct xbps_repo* repo, void* arg, bool* done UNUSED) {
 	struct ffdata* ffd = arg;
 	ffd->repouri       = repo->uri;
+	ffd->idx           = 0;
+	ffd->total         = xbps_dictionary_count(repo->idx);
 
 	xbps_array_t allkeys = xbps_dictionary_all_keys(repo->idx);
 	int          rv      = xbps_array_foreach_cb_multi(repo->xhp, allkeys, repo->idx,
@@ -242,93 +219,74 @@ int main(int argc, char** argv) {
 
 	if ((rv = xbps_init(&xh)) != 0) {
 		xbps_error_printf("Failed to initialize libxbps: %s\n", strerror(rv));
-		goto out_git;
+		goto out;
 	}
+
+	if (git_treebuilder_new(&ffd.tb, ffd.repo, NULL) != 0) {
+		const git_error* ge = git_error_last();
+		fprintf(stderr, "git: treebuilder new failed: %s\n",
+		        ge && ge->message ? ge->message : "unknown");
+		goto out;
+	}
+
 
 	/* iterate alle repos/pakketten (callbacks kunnen parallel lopen) */
 	rv = xbps_rpool_foreach(&xh, repo_ownedby_cb, &ffd);
 
+	git_oid        tree_id, commit_id;
+	git_tree*      tree;
+	git_signature* sig;
+	git_commit*    commit;
+	int            gr;
+
+	if (git_treebuilder_write(&tree_id, ffd.tb) != 0) {
+		const git_error* ge = git_error_last();
+		fprintf(stderr, "git: tree write failed: %s\n",
+		        ge && ge->message ? ge->message : "unknown");
+		goto out;
+	}
+
+	if (git_tree_lookup(&tree, ffd.repo, &tree_id) != 0) {
+		const git_error* ge = git_error_last();
+		fprintf(stderr, "git: tree lookup failed: %s\n",
+		        ge && ge->message ? ge->message : "unknown");
+		goto out;
+	}
+
+	if (git_signature_now(&sig, "xbps-files", "noreply@example") != 0) {
+		fprintf(stderr, "git: signature_now failed\n");
+		goto out;
+	}
+
+	gr = git_commit_create_v(&commit_id, ffd.repo,
+	                         "refs/heads/xbps-files",
+	                         sig, sig, NULL,
+	                         "xbps filelist snapshot", tree,
+	                         0 /* nparents */);
+	if (gr != 0) {
+		const git_error* ge = git_error_last();
+		fprintf(stderr, "git: commit failed: %s\n",
+		        ge && ge->message ? ge->message : "unknown");
+		rv = 1;
+	} else {
+		char oidstr[GIT_OID_HEXSZ + 1];
+		git_oid_tostr(oidstr, sizeof oidstr, &commit_id);
+		printf("commit %s written to refs/heads/xbps-files\n", oidstr);
+	}
+
 	/* xbps afsluiten */
 	xbps_end(&xh);
 
-	/* seriële fase: tree + commit */
-	if (rv == 0) {
-		git_treebuilder* tb = NULL;
-		git_oid          tree_id, commit_id;
-		git_tree*        tree = NULL;
-		git_signature*   sig  = NULL;
 
-		if (git_treebuilder_new(&tb, ffd.repo, NULL) != 0) {
-			const git_error* ge = git_error_last();
-			fprintf(stderr, "git: treebuilder new failed: %s\n",
-			        ge && ge->message ? ge->message : "unknown");
-			rv = 1;
-			goto after_tree;
-		}
+out:
+	/* opruimen gedeelde state */
 
-		for (size_t i = 0; i < ffd.results.cnt; i++) {
-			int gr = git_treebuilder_insert(NULL, tb,
-			                                ffd.results.ents[i].name,
-			                                &ffd.results.ents[i].oid,
-			                                GIT_FILEMODE_BLOB);
-			if (gr != 0) {
-				const git_error* ge = git_error_last();
-				fprintf(stderr, "git: tree insert failed for %s: %s\n",
-				        ffd.results.ents[i].name,
-				        ge && ge->message ? ge->message : "unknown");
-				/* je kunt hier desnoods 'continue' doen; we failen hard: */
-				rv = 1; /* maar ga door om resources te vrijwaren */
-			}
-		}
+	if (ffd.tb) git_treebuilder_free(ffd.tb);
+	if (tree) git_tree_free(tree);
+	if (sig) git_signature_free(sig);
 
-		if (rv == 0 && git_treebuilder_write(&tree_id, tb) != 0) {
-			const git_error* ge = git_error_last();
-			fprintf(stderr, "git: tree write failed: %s\n",
-			        ge && ge->message ? ge->message : "unknown");
-			rv = 1;
-		}
-
-		if (rv == 0 && git_tree_lookup(&tree, ffd.repo, &tree_id) != 0) {
-			const git_error* ge = git_error_last();
-			fprintf(stderr, "git: tree lookup failed: %s\n",
-			        ge && ge->message ? ge->message : "unknown");
-			rv = 1;
-		}
-
-		if (rv == 0 && git_signature_now(&sig, "xbps-files", "noreply@example") != 0) {
-			fprintf(stderr, "git: signature_now failed\n");
-			rv = 1;
-		}
-
-		if (rv == 0) {
-			int gr = git_commit_create_v(&commit_id, ffd.repo,
-			                             "refs/heads/xbps-files",
-			                             sig, sig, NULL,
-			                             "xbps filelist snapshot", tree,
-			                             0 /* nparents */);
-			if (gr != 0) {
-				const git_error* ge = git_error_last();
-				fprintf(stderr, "git: commit failed: %s\n",
-				        ge && ge->message ? ge->message : "unknown");
-				rv = 1;
-			} else {
-				char oidstr[GIT_OID_HEXSZ + 1];
-				git_oid_tostr(oidstr, sizeof oidstr, &commit_id);
-				printf("commit %s written to refs/heads/xbps-files\n", oidstr);
-			}
-		}
-
-	after_tree:
-		if (tb) git_treebuilder_free(tb);
-		if (tree) git_tree_free(tree);
-		if (sig) git_signature_free(sig);
-	}
-
-out_git:
 	git_repository_set_head(ffd.repo, "ref/heads/xbps-files");
 
-	/* opruimen gedeelde state */
-	result_free(&ffd.results);
 	if (ffd.repo) git_repository_free(ffd.repo);
 	pthread_mutex_destroy(&ffd.gitmtx);
 	git_libgit2_shutdown();
