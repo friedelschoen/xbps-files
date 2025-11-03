@@ -1,7 +1,7 @@
 CC      = cc
 CFLAGS  = -std=gnu99 -Wall -Wextra -O2 -g
 LDFLAGS =
-TARGETS = xlocate
+TARGETS = xbps-provides xbps-provides-db
 HEADERS = arg.h
 PREFIX  = /usr/local
 PKGS 	= libgit2 libxbps
